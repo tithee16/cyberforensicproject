@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, redirect, session, flash
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = "secret123"
@@ -15,6 +15,10 @@ records = db["records"]
 logs = db["logs"]
 alerts = db["alerts"]
 
+
+MAX_ATTEMPTS = 5
+BLOCK_TIME = 2  # minutes
+
 def get_ip():
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
@@ -22,10 +26,30 @@ def get_ip():
     return request.remote_addr
 
 def add_alert(alert_type, message, severity="medium"):
-    alerts.insert_one({
+    alert_data = {
         "type": alert_type,
         "message": message,
         "severity": severity,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    alerts.insert_one(alert_data)
+
+    print("\n ===== ATTACK ALERT =====")
+    print(f"Type     : {alert_type}")
+    print(f"Severity : {severity}")
+    print(f"Message  : {message}")
+    print(f"Time     : {alert_data['time']}")
+    print(" ========================\n")
+
+
+
+def log_event(event, username=None, details=None):
+    logs.insert_one({
+        "event": event,
+        "username": username,
+        "ip": get_ip(),
+        "details": details,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
@@ -66,44 +90,79 @@ def login():
         username = request.form['username']
         password = request.form['password']
         ip = get_ip()
+        now = datetime.now()
 
+        # ---------------- BLOCK CHECK ----------------
+        blocked = alerts.find_one({
+            "ip": ip,
+            "type": "blocked",
+            "block_until": {"$gt": now}
+        })
+
+        if blocked:
+            flash("Too many attempts. Try later.")
+            return redirect('/login')
+
+        # ---------------- LOGIN CHECK ----------------
         user = users.find_one({"username": username})
 
         if user and check_password_hash(user['password'], password):
-            session['username'] = username
 
             logs.insert_one({
                 "event": "login_success",
                 "username": username,
                 "ip": ip,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "time": now
             })
 
+            session['username'] = username
             return redirect('/dashboard')
 
-        # failed login
+        # ---------------- FAILED LOGIN ----------------
         logs.insert_one({
             "event": "login_failed",
             "username": username,
             "ip": ip,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "time": now
         })
 
-        recent_failures = logs.count_documents({
+        # Count recent failures (last 2 minutes)
+        time_window = now - timedelta(minutes=2)
+
+        failures = logs.count_documents({
             "event": "login_failed",
-            "ip": ip
+            "ip": ip,
+            "time": {"$gte": time_window}
         })
 
-        if recent_failures >= 5:
-            add_alert(
-                "credential_attack",
-                f"Multiple failed logins from {ip}",
-                "high"
-            )
+        # ---------------- DETECTION ----------------
+        if failures >= MAX_ATTEMPTS:
+            print(f"[ALERT] Brute force attack detected from IP: {ip}")
+            block_until = now + timedelta(minutes=BLOCK_TIME)
 
-        flash("Invalid Login")
+            add_alert(
+                "brute_force",
+                f"Brute force detected from {ip} (Attempts: {failures})",
+                "high"
+                )
+
+            alerts.insert_one({
+                "type": "blocked",
+                "ip": ip,
+                "block_until": block_until
+            })
+
+            flash("Too many attempts. IP blocked.")
+            return redirect('/login')
+
+        flash("Invalid login")
 
     return render_template("login.html")
+
+@app.before_request
+def track_all_requests():
+    if request.endpoint not in ['static']:
+        log_event("page_visit", session.get('username'), request.path)
 
 # ---------------- DASHBOARD ----------------
 @app.route('/dashboard')
@@ -132,12 +191,17 @@ def add_record():
             "id": rid,
             "name": name,
             "salary": salary,
-            "dept": dept
+            "dept": dept,
+            "owner": session['username'] #vulnerability
         })
 
-        return redirect('/dashboard')
+        log_event(
+            event="record_added",
+            username=session['username'],
+            details=f"Added record: {name}, Salary: {salary}, Dept: {dept}"
+        )
 
-    return render_template("add_record.html")
+        return redirect('/dashboard')
 
 # ---------------- LOGOUT ----------------
 @app.route('/logout')
@@ -154,5 +218,33 @@ def view_alerts():
     print(all_alerts)
     return render_template("alerts.html", data=all_alerts)
 
+@app.route('/record/<rid>')
+def view_record(rid):
+    if 'username' not in session:
+        return redirect('/login')
+
+    ip = request.remote_addr
+    username = session['username']
+
+    record = records.find_one({"id": rid})
+
+    if not record:
+        return "Record not found"
+
+    # VULNERABILITY: no ownership check, Anyone can view any record by changing ID
+
+    # forensic log
+    logs.insert_one({
+        "event": "record_access",
+        "record_id": rid,
+        "accessed_by": username,
+        "owner": record.get("owner"),
+        "ip": ip,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+    return render_template("view_record.html", record=record)
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)
+    
